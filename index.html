@@ -167,7 +167,7 @@
 // Bump VERSION every time you change this file. It shows in the header, so on
 // the phone you can instantly see whether you're running the new build or a
 // stale cached one.
-const VERSION='v3.1';
+const VERSION='v4.0';
 document.getElementById('ver').textContent=VERSION;
 
 // "Get latest version": wipes cached copies of the app and reloads with a
@@ -212,24 +212,58 @@ hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
   ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.ITF
 ]);
 
+// ---- native barcode engine (Google's, built into Android Chrome) -----------
+// Hardware-accelerated, tolerant of tilt/blur, and detects MULTIPLE barcodes
+// per frame — so Mat + CH get caught in one glance. ZXing is the fallback for
+// browsers that don't have it.
+let nativeDetector=null;
+try{
+  if('BarcodeDetector' in window){
+    nativeDetector=new BarcodeDetector({formats:['code_128','code_39','data_matrix','qr_code','itf','ean_13']});
+  }
+}catch(_){ nativeDetector=null; }
+
 async function startCamera(){
   stopCamera();
   try{
     setStatus('Starting camera…','busy');
-    codeReader=new ZXing.BrowserMultiFormatReader(hints, 200 /* ms between decode attempts */);
-    await codeReader.decodeFromConstraints(
-      {video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false},
-      vid,
-      (result,err)=>{ if(result&&result.getText) onBarcode(result.getText().trim()); }
-    );
-    scanning=true;
-    stream=vid.srcObject;
-    track=stream?stream.getVideoTracks()[0]:null;
-    if(track) setupCapabilities();
-    setStatus('Scanning… point at a barcode','live');
+    if(nativeDetector){
+      stream=await navigator.mediaDevices.getUserMedia(
+        {video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
+      vid.srcObject=stream; await vid.play();
+      track=stream.getVideoTracks()[0]; if(track) setupCapabilities();
+      scanning=true; nativeLoop(); startOcrLoop();
+      setStatus('Reading label… hold steady','live');
+    } else {
+      codeReader=new ZXing.BrowserMultiFormatReader(hints, 200);
+      await codeReader.decodeFromConstraints(
+        {video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false},
+        vid,
+        (result,err)=>{ if(result&&result.getText) onBarcode(result.getText().trim()); }
+      );
+      scanning=true;
+      stream=vid.srcObject;
+      track=stream?stream.getVideoTracks()[0]:null;
+      if(track) setupCapabilities();
+      startOcrLoop();
+      setStatus('Reading label… hold steady','live');
+    }
   }catch(e){ setStatus('Camera blocked — use Upload photo','busy'); console.error(e); }
 }
-function stopCamera(){ scanning=false;
+
+// native loop: ~7 checks/sec, ALL barcodes in the frame at once
+async function nativeLoop(){
+  while(scanning){
+    try{
+      if(vid.videoWidth){
+        const codes=await nativeDetector.detect(vid);
+        if(codes&&codes.length){ for(const c of codes){ if(c.rawValue) onBarcode(c.rawValue.trim()); } }
+      }
+    }catch(_){}
+    await new Promise(r=>setTimeout(r,140));
+  }
+}
+function stopCamera(){ scanning=false; stopOcrLoop();
   try{ if(codeReader) codeReader.reset(); }catch(_){}
   if(stream){ try{stream.getTracks().forEach(t=>t.stop());}catch(_){} stream=null; }
 }
@@ -264,8 +298,69 @@ focusBtn.addEventListener('click',()=>{ if(!track)return;
   setStatus('Refocusing…','busy'); setTimeout(()=>setStatus('Scanning…','live'),700);
 });
 
-// (the old hand-rolled frame loop is gone — ZXing's decodeFromConstraints
-//  above handles continuous decoding correctly)
+// ---- continuous LIVE TEXT READING (v4) --------------------------------------
+// The camera text is the ground truth (barcodes are often damaged). This loop
+// OCRs the central frame region over and over. A mandatory value (Mat/Char) is
+// only accepted once the SAME value has been read in two different frames —
+// frame-voting — so one blurry misread can't land in the table.
+let ocrLoopOn=false;
+const ocrVotes={};            // field -> {value: timesSeen}
+const NEED_VOTES=2;           // frames that must agree for Mat/Char
+
+async function startOcrLoop(){
+  if(ocrLoopOn) return;
+  ocrLoopOn=true;
+  if(!worker){ worker=await Tesseract.createWorker('eng'); await worker.setParameters({tessedit_pageseg_mode:'6'}); }
+  while(ocrLoopOn&&scanning){
+    try{
+      if(vid.videoWidth){
+        const {data}=await worker.recognize(centerCrop(vid));
+        const p=parseOcr(data.text||'');
+        for(const k in p) castVote(k,p[k]);
+      }
+    }catch(_){}
+    await new Promise(r=>setTimeout(r,350));
+  }
+  ocrLoopOn=false;
+}
+function stopOcrLoop(){ ocrLoopOn=false; }
+
+// crop to the central region (where the reticle is), upscale + clean for OCR
+function centerCrop(src){
+  const w=src.videoWidth,h=src.videoHeight;
+  const mx=Math.round(w*0.06), my=Math.round(h*0.10);
+  const cw=w-2*mx, ch=h-2*my;
+  const c=document.createElement('canvas');
+  const sc=Math.min(2.2, 1900/Math.max(cw,ch)+0.001);
+  c.width=Math.round(cw*sc); c.height=Math.round(ch*sc);
+  const ctx=c.getContext('2d');
+  ctx.filter='grayscale(1) contrast(1.25)';
+  ctx.drawImage(src,mx,my,cw,ch,0,0,c.width,c.height);
+  return c;
+}
+
+// frame-voting: mandatory fields need NEED_VOTES agreeing reads; other fields
+// fill on first read (they're review-card checked anyway). Barcode values are
+// never overwritten — a barcode read is still more certain when available.
+function castVote(field,value){
+  if(!value) return;
+  if(found[field]&&found[field].src==='bc') return;
+  const mandatory=(field==='Mat'||field==='Char');
+  if(!mandatory){ if(!found[field]) found[field]={value,src:'ocr'}; return; }
+  ocrVotes[field]=ocrVotes[field]||{};
+  ocrVotes[field][value]=(ocrVotes[field][value]||0)+1;
+  if(ocrVotes[field][value]>=NEED_VOTES && (!found[field]||found[field].value!==value)){
+    found[field]={value,src:'ocr'};
+    reticle.classList.add('hit'); setTimeout(()=>reticle.classList.remove('hit'),300);
+    beep();
+    checkMandatory();
+  } else if(!found[field]) {
+    // show progress: one read seen, waiting for confirmation
+    statusEl.className='status busy';
+    statusTxt.textContent=field+' '+value+' — confirming…';
+  }
+}
+
 
 let lastBeep=0, lastAdded='', autoMode=true, ocrBusy=false;
 const autoChip=document.getElementById('autoChip');
@@ -332,6 +427,7 @@ function autoAdd(){
   beep(); setTimeout(beep,140);
   setTimeout(()=>{ splash.classList.remove('show');
     found={}; current=null; review.classList.remove('show');
+    for(const k in ocrVotes) delete ocrVotes[k];
     setStatus('Row added — next tag','live'); },900);
 }
 function beep(){try{const a=new (window.AudioContext||window.webkitAudioContext)();
@@ -417,20 +513,23 @@ function applyBarcodes(codes,found){
 function parseOcr(text){
   const j=text.split(/\n/).map(l=>l.trim()).filter(Boolean).join('\n'); const out={};
   const g=re=>{const m=j.match(re);return m?m[1].trim():'';};
-  let def=g(/Mat\.?\s*[A-Z0-9]+\s*\n\s*([A-Z][A-Z0-9 .\/-]{3,})/);
-  if(!def){const lines=j.split('\n');def=lines.find(l=>/^[A-Z][A-Z0-9 .\/-]{4,}$/.test(l)&&!/GRAVITY|SCHWEIZ|BEYOND/i.test(l))||'';}
+  let def=g(/Mat\.?\s*[A-Z0-9-]+\s*\n\s*([A-Z][A-Z0-9 ,.\/-]{3,})/);
+  if(!def){const lines=j.split('\n');def=lines.find(l=>/^[A-Z][A-Z0-9 ,.\/-]{4,}$/.test(l)&&!/GRAVITY|SCHWEIZ|BEYOND|PNF|LNR/i.test(l))||'';}
   if(def)out.Definition=def;
   let r;
   if(r=g(/Rev\.?\s*([A-Z])\b/))out.Rev=r;
-  if(r=g(/SerNr\.?\s*(\d{4,})/))out.SerNr=r;
-  if(r=g(/(?:^|\n)\s*Char\.?\s*(\d{4,})/))out.Char=r;
-  if(r=g(/L-?Char\.?\s*(\d{6,})/))out['L-Char']=r;
-  if(r=g(/Mat\.?\s*([A-Z]?\d{4,}[A-Z]?)/))out.Mat=out.Mat||r;
+  if(r=g(/SerNr\.?\s*(\d{2,})/))out.SerNr=r;
+  // Char.: 5-7 digit batch on its own line; [CG] tolerates OCR reading C as G
+  if(r=g(/(?:^|\n)\s*[CG]har\.?\s*[:.]?\s*(\d{5,7})\b/))out.Char=r;
+  if(r=g(/L-?[CG]har\.?\s*[:.]?\s*(\d{4,})/))out['L-Char']=r;
+  // Mat.: letters+digits code straight after the word Mat (N3508108X, CN400190-R, 3007458)
+  if(r=g(/Mat\.?\s*[:.]?\s*([A-Z]{0,2}\d{4,}[A-Z0-9-]{0,6})/i))out.Mat=out.Mat||r.toUpperCase();
   if(r=g(/Menge:?\s*\n?\s*(\d{3,})/))out.Auftr=r;
   if(r=g(/(\d+\.\d{3})\b/))out.Menge=r;
   if(r=g(/\b(ST|PCS|KG|M)\b/))out.Einheit=r;
   if(r=g(/Verfallsdatum:?\s*(\d{2}\.\d{2}\.\d{4})/))out.Verfallsdatum=r;
   if(r=g(/(CH-?\d{5,})/))out['CH-Nr']=out['CH-Nr']||r.replace(/^CH-?/,'CH-');
+  if(r=g(/(EQ-?\d{5,})/))out['CH-Nr']=out['CH-Nr']||r;
   return out;
 }
 
