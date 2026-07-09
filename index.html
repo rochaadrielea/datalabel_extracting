@@ -167,7 +167,7 @@
 // Bump VERSION every time you change this file. It shows in the header, so on
 // the phone you can instantly see whether you're running the new build or a
 // stale cached one.
-const VERSION='v3.0';
+const VERSION='v3.1';
 document.getElementById('ver').textContent=VERSION;
 
 // "Get latest version": wipes cached copies of the app and reloads with a
@@ -199,25 +199,40 @@ const exportBtn=document.getElementById('exportBtn'), clearBtn=document.getEleme
 function setStatus(t,c){statusTxt.textContent=t;statusEl.className='status'+(c?' '+c:'');}
 
 // ---- camera + continuous barcode scanning ----------------------------------
-let stream=null, track=null, scanning=false, reader=null;
-let found={};   // fields caught for the CURRENT label (cleared on Add/Discard)
+// Uses ZXing's built-in continuous decoder (decodeFromConstraints): it owns the
+// camera stream and calls us on every successful decode. Frames are processed
+// in memory and discarded — nothing is saved.
+let stream=null, track=null, scanning=false, codeReader=null;
+let found={};   // fields caught for the CURRENT label (cleared on add/discard)
 const hints=new Map();
 hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+  ZXing.BarcodeFormat.CODE_128, ZXing.BarcodeFormat.CODE_39,
+  ZXing.BarcodeFormat.DATA_MATRIX, ZXing.BarcodeFormat.QR_CODE,
+  ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.ITF
+]);
 
 async function startCamera(){
   stopCamera();
   try{
     setStatus('Starting camera…','busy');
-    stream=await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
-    vid.srcObject=stream; await vid.play();
-    track=stream.getVideoTracks()[0];
-    setupCapabilities();
-    beginScanLoop();
+    codeReader=new ZXing.BrowserMultiFormatReader(hints, 200 /* ms between decode attempts */);
+    await codeReader.decodeFromConstraints(
+      {video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false},
+      vid,
+      (result,err)=>{ if(result&&result.getText) onBarcode(result.getText().trim()); }
+    );
+    scanning=true;
+    stream=vid.srcObject;
+    track=stream?stream.getVideoTracks()[0]:null;
+    if(track) setupCapabilities();
     setStatus('Scanning… point at a barcode','live');
   }catch(e){ setStatus('Camera blocked — use Upload photo','busy'); console.error(e); }
 }
-function stopCamera(){ scanning=false; if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;} }
+function stopCamera(){ scanning=false;
+  try{ if(codeReader) codeReader.reset(); }catch(_){}
+  if(stream){ try{stream.getTracks().forEach(t=>t.stop());}catch(_){} stream=null; }
+}
 
 // expose zoom / torch only if the phone camera supports them
 function setupCapabilities(){
@@ -249,27 +264,8 @@ focusBtn.addEventListener('click',()=>{ if(!track)return;
   setStatus('Refocusing…','busy'); setTimeout(()=>setStatus('Scanning…','live'),700);
 });
 
-// the live loop: grab a frame, try to decode, repeat (~8x per second)
-function beginScanLoop(){
-  reader=new ZXing.MultiFormatReader(); reader.setHints(hints);
-  scanning=true;
-  const cv=document.createElement('canvas'); const ctx=cv.getContext('2d',{willReadFrequently:true});
-  const tick=()=>{
-    if(!scanning) return;
-    if(!vid.videoWidth){ requestAnimationFrame(tick); return; }
-    cv.width=vid.videoWidth; cv.height=vid.videoHeight; ctx.drawImage(vid,0,0);
-    try{
-      const img=ctx.getImageData(0,0,cv.width,cv.height);
-      const lum=new ZXing.RGBLuminanceSource(img.data,cv.width,cv.height);
-      const bmp=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
-      const res=reader.decode(bmp);
-      if(res&&res.text) onBarcode(res.text.trim());
-      reader.reset();
-    }catch(_){ /* no code in this frame — normal */ }
-    setTimeout(()=>requestAnimationFrame(tick),120);
-  };
-  requestAnimationFrame(tick);
-}
+// (the old hand-rolled frame loop is gone — ZXing's decodeFromConstraints
+//  above handles continuous decoding correctly)
 
 let lastBeep=0, lastAdded='', autoMode=true, ocrBusy=false;
 const autoChip=document.getElementById('autoChip');
