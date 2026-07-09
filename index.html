@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>WAE Label Scanner</title>
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  :root {
+    --bg: #0E1116;
+    --panel: #161B22;
+    --panel-2: #1C232D;
+    --line: #2A3441;
+    --ink: #E8EDF2;
+    --ink-dim: #8B98A8;
+    --signal: #35E0A1;      /* scan-green, the one bold accent */
+    --signal-dim: #1E7D5C;
+    --warn: #FFB454;
+    --bad: #FF6B6B;
+    --mono: "SF Mono", ui-monospace, "Roboto Mono", Menlo, monospace;
+    --sans: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); }
+  body { padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+
+  header {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 16px 18px 12px; border-bottom: 1px solid var(--line);
+  }
+  header .tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 2px;
+    color: var(--bg); background: var(--signal); padding: 3px 7px; border-radius: 3px; font-weight: 700;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .3px; }
+  header .count { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--ink-dim); }
+  header .count b { color: var(--signal); font-size: 15px; }
+
+  .wrap { padding: 14px; max-width: 640px; margin: 0 auto; }
+
+  /* camera */
+  .stage {
+    position: relative; border-radius: 14px; overflow: hidden;
+    background: #000; border: 1px solid var(--line); aspect-ratio: 3/4; max-height: 52vh; margin: 0 auto;
+  }
+  video, .stage canvas.frame { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .reticle {
+    position: absolute; inset: 12% 8%; border: 2px solid var(--signal);
+    border-radius: 10px; box-shadow: 0 0 0 100vmax rgba(0,0,0,.35); pointer-events: none;
+    opacity: .9;
+  }
+  .reticle::before {
+    content: ""; position: absolute; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--signal), transparent);
+    animation: sweep 2.4s ease-in-out infinite;
+  }
+  @keyframes sweep { 0%,100% { top: 4%; } 50% { top: 94%; } }
+  @media (prefers-reduced-motion: reduce) { .reticle::before { animation: none; top: 50%; } }
+
+  .status {
+    position: absolute; left: 10px; bottom: 10px; right: 10px;
+    font-family: var(--mono); font-size: 12px; color: var(--ink);
+    background: rgba(14,17,22,.75); backdrop-filter: blur(6px);
+    padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+  }
+  .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-dim); margin-right: 7px; vertical-align: 1px; }
+  .status.live .dot { background: var(--signal); box-shadow: 0 0 8px var(--signal); }
+  .status.busy .dot { background: var(--warn); }
+
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0; }
+  button {
+    font-family: var(--sans); font-size: 15px; font-weight: 600;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+    padding: 14px; border-radius: 11px; cursor: pointer; transition: transform .05s, background .15s;
+  }
+  button:active { transform: scale(.98); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--signal); color: #08130E; border-color: var(--signal); grid-column: 1 / -1; }
+  button.ghost { background: transparent; }
+
+  input[type=file] { display: none; }
+
+  /* review card */
+  .review { background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 4px 4px 10px; margin: 14px 0; display: none; }
+  .review.show { display: block; }
+  .review h2 { font-size: 12px; font-family: var(--mono); letter-spacing: 1px; color: var(--ink-dim); margin: 12px 14px 8px; text-transform: uppercase; }
+  .fields { display: grid; gap: 1px; background: var(--line); border-radius: 9px; overflow: hidden; margin: 0 10px; }
+  .field { display: grid; grid-template-columns: 96px 1fr; align-items: center; background: var(--panel-2); }
+  .field label { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); padding: 0 0 0 12px; letter-spacing: .5px; }
+  .field input {
+    font-family: var(--mono); font-size: 14px; color: var(--ink); background: transparent;
+    border: none; padding: 11px 12px; width: 100%; outline: none;
+  }
+  .field input:focus { background: rgba(53,224,161,.07); }
+  .field.src-bc label::after { content: " ▪"; color: var(--signal); }
+  .field.src-ocr label::after { content: " ▪"; color: var(--warn); }
+  .legend { font-family: var(--mono); font-size: 10px; color: var(--ink-dim); margin: 8px 14px 0; }
+  .legend .g { color: var(--signal); } .legend .o { color: var(--warn); }
+
+  /* table */
+  .tablewrap { margin: 8px 0 90px; border: 1px solid var(--line); border-radius: 12px; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12px; }
+  th { background: var(--panel-2); color: var(--ink-dim); text-align: left; padding: 9px 10px; position: sticky; top: 0; font-weight: 600; letter-spacing: .5px; white-space: nowrap; }
+  td { padding: 9px 10px; border-top: 1px solid var(--line); white-space: nowrap; color: var(--ink); }
+  tr:nth-child(even) td { background: rgba(255,255,255,.015); }
+  td.del { color: var(--bad); cursor: pointer; text-align: center; width: 34px; }
+  .empty { color: var(--ink-dim); font-family: var(--mono); font-size: 12px; text-align: center; padding: 22px; }
+
+  .exportbar {
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 14px calc(12px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, var(--bg) 22%); display: flex; gap: 10px; max-width: 640px; margin: 0 auto;
+  }
+  .exportbar button { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <span class="tag">WAE</span>
+  <h1>Label Scanner</h1>
+  <span class="count"><b id="cnt">0</b> rows</span>
+</header>
+
+<div class="wrap">
+  <div class="stage">
+    <video id="vid" playsinline muted></video>
+    <div class="reticle"></div>
+    <div class="status" id="status"><span class="dot"></span><span id="statustxt">Camera off</span></div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="startBtn">Start camera</button>
+    <button id="snapBtn" disabled>Capture label</button>
+    <button class="ghost" id="fileBtn">Upload photo</button>
+    <input type="file" id="fileInput" accept="image/*" capture="environment">
+  </div>
+
+  <div class="review" id="review">
+    <h2>Review &amp; confirm</h2>
+    <div class="fields" id="fields"></div>
+    <div class="legend"><span class="g">▪</span> from barcode &nbsp; <span class="o">▪</span> from OCR — check the amber ones</div>
+    <div class="controls" style="margin:12px 10px 4px;">
+      <button class="ghost" id="discardBtn">Discard</button>
+      <button class="primary" id="addBtn" style="grid-column:auto;">Add row</button>
+    </div>
+  </div>
+
+  <div class="tablewrap">
+    <table id="tbl">
+      <thead><tr id="head"></tr></thead>
+      <tbody id="body"><tr><td class="empty" colspan="12">No rows yet. Scan or upload a label.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="exportbar">
+  <button id="clearBtn" class="ghost">Clear all</button>
+  <button id="exportBtn" class="primary" style="grid-column:auto;">Export .xlsx</button>
+</div>
+
+<script>
+// ============================================================================
+//  WAE LABEL SCANNER  —  how the whole thing fits together
+//  ---------------------------------------------------------------------------
+//  One scan runs this pipeline:
+//     processCanvas()  ->  readAllBarcodes()  (ZXing: barcodes + datamatrix)
+//                      ->  ocr()              (Tesseract.js: the text)
+//                      ->  renderReview()     (you check + fix)
+//                      ->  Add row            (pushes into `rows`)
+//     Export .xlsx     ->  SheetJS turns `rows` into a real Excel file
+//
+//  Want to change the columns?  Edit COLS below — everything else follows it.
+//  Want to fix an OCR misread?  Edit the regex rules in applyOcr().
+// ============================================================================
+
+// ---- schema: the single source of truth for your columns -------------------
+// Add / remove / rename here and it flows through the review card, the on-screen
+// table, and the Excel export automatically. Nothing else hard-codes the list.
+const COLS = ["Mat","Definition","Rev","SerNr","Char","L-Char","Auftr","Menge","Einheit","Verfallsdatum","CH-Nr"];
+
+const STORE_KEY = 'wae_label_rows_v1';           // where rows persist in the browser
+const rows = loadRows();                          // survives a phone-browser refresh
+let current = null;                               // the scan currently under review
+
+// rows persist in the browser so a reload / accidental close doesn't wipe your work.
+// (This is browser storage, NOT an Excel file — the real .xlsx is written on Export.)
+function loadRows(){ try { return JSON.parse(localStorage.getItem(STORE_KEY)) || []; } catch(_) { return []; } }
+function saveRows(){ try { localStorage.setItem(STORE_KEY, JSON.stringify(rows)); } catch(_){} }
+
+// ---- element refs ----------------------------------------------------------
+const vid = document.getElementById('vid');
+const statusEl = document.getElementById('status');
+const statusTxt = document.getElementById('statustxt');
+const startBtn = document.getElementById('startBtn');
+const snapBtn = document.getElementById('snapBtn');
+const fileBtn = document.getElementById('fileBtn');
+const fileInput = document.getElementById('fileInput');
+const review = document.getElementById('review');
+const fieldsEl = document.getElementById('fields');
+const addBtn = document.getElementById('addBtn');
+const discardBtn = document.getElementById('discardBtn');
+const exportBtn = document.getElementById('exportBtn');
+const clearBtn = document.getElementById('clearBtn');
+
+function setStatus(txt, cls){ statusTxt.textContent = txt; statusEl.className = 'status' + (cls?(' '+cls):''); }
+
+// ---- camera ----------------------------------------------------------------
+let stream = null;
+startBtn.addEventListener('click', async () => {
+  if (stream) { stopCam(); return; }
+  try {
+    setStatus('Starting camera…','busy');
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    });
+    vid.srcObject = stream; await vid.play();
+    startBtn.textContent = 'Stop camera';
+    snapBtn.disabled = false;
+    setStatus('Point at the label, then Capture','live');
+  } catch (e) {
+    setStatus('Camera blocked — use Upload photo instead','busy');
+    console.error(e);
+  }
+});
+function stopCam(){
+  if (stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  vid.srcObject=null; startBtn.textContent='Start camera'; snapBtn.disabled=true; setStatus('Camera off');
+}
+
+// grab a still frame from the video into a canvas
+function grabFrame(){
+  const c = document.createElement('canvas');
+  c.width = vid.videoWidth; c.height = vid.videoHeight;
+  c.getContext('2d').drawImage(vid, 0, 0, c.width, c.height);
+  return c;
+}
+
+snapBtn.addEventListener('click', () => { if (vid.videoWidth) processCanvas(grabFrame()); });
+
+// ---- upload path -----------------------------------------------------------
+fileBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext('2d').drawImage(img,0,0); processCanvas(c);
+  };
+  img.src = URL.createObjectURL(f);
+  fileInput.value = '';
+});
+
+// ---- pipeline: barcodes first, OCR fallback --------------------------------
+const zxingReader = new ZXing.BrowserMultiFormatReader();
+
+async function processCanvas(canvas){
+  setStatus('Reading codes…','busy');
+  const found = {}; // field -> {value, src}
+
+  // 1) barcodes + datamatrix (can be several on one label)
+  const codes = await readAllBarcodes(canvas);
+  applyBarcodes(codes, found);
+
+  // 2) OCR for the text-only fields (Definition, Rev, and anything codes missed)
+  setStatus('Reading text…','busy');
+  const text = await ocr(canvas);
+  applyOcr(text, found);
+
+  current = {};
+  COLS.forEach(c => current[c] = found[c] || {value:'', src:''});
+  renderReview();
+  setStatus(stream ? 'Point at the label, then Capture' : 'Camera off', stream ? 'live' : '');
+}
+
+async function readAllBarcodes(canvas){
+  const results = [];
+  // ZXing decodeFromImage works off an <img> or canvas dataURL
+  const url = canvas.toDataURL('image/png');
+  const img = new Image(); img.src = url; await img.decode().catch(()=>{});
+  // try the whole frame + a few rotations, collect every hit
+  for (const deg of [0,90,180,270]){
+    try {
+      const rc = rotateCanvas(canvas, deg);
+      const rimg = new Image(); rimg.src = rc.toDataURL('image/png'); await rimg.decode().catch(()=>{});
+      const r = await zxingReader.decodeFromImageElement(rimg).catch(()=>null);
+      if (r && r.text) results.push(r.text.trim());
+    } catch(_){}
+  }
+  return [...new Set(results)];
+}
+
+function rotateCanvas(src, deg){
+  if (deg===0) return src;
+  const c=document.createElement('canvas'); const ctx=c.getContext('2d');
+  if (deg===180){ c.width=src.width; c.height=src.height; ctx.translate(c.width,c.height); ctx.rotate(Math.PI); }
+  else { c.width=src.height; c.height=src.width; ctx.translate(c.width/2,c.height/2); ctx.rotate(deg*Math.PI/180); ctx.translate(-src.width/2,-src.height/2); }
+  ctx.drawImage(src,0,0); return c;
+}
+
+// Map decoded barcode strings onto fields. These are the RELIABLE fields
+// (green dot in the review card). Each `if` is a rule: "a code shaped like X
+// is field Y." Add a rule here if a label carries a code we don't yet catch.
+function applyBarcodes(codes, found){
+  for (const raw of codes){
+    const s = raw.trim();
+    if (/^CH-?\d+/i.test(s)) { found['CH-Nr'] = {value:s.replace(/^CH-?/i,'CH-'), src:'bc'};
+      // CH-860001 -> SerNr 860001 (right of the dash)
+      const n = s.replace(/^CH-?/i,''); if (/^\d+$/.test(n) && !found['SerNr']) found['SerNr']={value:n,src:'bc'};
+      continue; }
+    if (/^EQ-?\d+/i.test(s)) { found['CH-Nr'] = {value:s, src:'bc'}; continue; }
+    // material numbers: letter+digits (C3474532B) or pure long digits (3006231)
+    if (/^[A-Z]?\d{4,}[A-Z]?$/.test(s) && !found['Mat']) { found['Mat']={value:s,src:'bc'}; continue; }
+    // 10-digit L-Char
+    if (/^\d{10}$/.test(s) && !found['L-Char']) { found['L-Char']={value:s,src:'bc'}; continue; }
+  }
+}
+
+// ---- OCR -------------------------------------------------------------------
+let worker=null;
+async function ocr(canvas){
+  if (!worker){ worker = await Tesseract.createWorker('eng'); }
+  // upscale + grayscale a little to help small print
+  const c=document.createElement('canvas'); const sc=Math.min(2, 2200/Math.max(canvas.width,canvas.height)+0.001);
+  c.width=canvas.width*sc; c.height=canvas.height*sc;
+  const ctx=c.getContext('2d'); ctx.filter='grayscale(1) contrast(1.15)'; ctx.drawImage(canvas,0,0,c.width,c.height);
+  const { data } = await worker.recognize(c);
+  return data.text || '';
+}
+
+// Pull fields out of the OCR text (amber dot = check these). This is the part
+// you TUNE as you meet new label variants. Each `grab(/.../)` is a pattern:
+//   /Rev\.?\s*([A-Z])\b/  ==  "find 'Rev.' then capture the single letter after it"
+// If a field reads wrong on a certain label, adjust its regex here.
+function applyOcr(text, found){
+  const lines = text.split(/\n/).map(l=>l.trim()).filter(Boolean);
+  const joined = lines.join('\n');
+
+  const grab = (re) => { const m = joined.match(re); return m ? m[1].trim() : ''; };
+
+  // Definition: line right after Mat. code, usually all-caps words (HELICALCOIL SL BZ)
+  if (!found['Definition']){
+    let def = grab(/Mat\.?\s*[A-Z0-9]+\s*\n\s*([A-Z][A-Z0-9 .\/-]{3,})/);
+    if (!def){ const cap = lines.find(l => /^[A-Z][A-Z0-9 .\/-]{4,}$/.test(l) && !/GRAVITY|SCHWEIZ|BEYOND/i.test(l)); def = cap||''; }
+    if (def) found['Definition']={value:def, src:'ocr'};
+  }
+  // Rev.  X   (single letter A-D)
+  if (!found['Rev']){ const r = grab(/Rev\.?\s*([A-Z])\b/); if (r) found['Rev']={value:r,src:'ocr'}; }
+  // SerNr. 860001
+  if (!found['SerNr']){ const r = grab(/SerNr\.?\s*(\d{4,})/); if (r) found['SerNr']={value:r,src:'ocr'}; }
+  // Char. 860001  (avoid catching L-Char)
+  if (!found['Char']){ const r = grab(/(?:^|\n)\s*Char\.?\s*(\d{4,})/); if (r) found['Char']={value:r,src:'ocr'}; }
+  // L-Char. 1003473486
+  if (!found['L-Char']){ const r = grab(/L-?Char\.?\s*(\d{6,})/); if (r) found['L-Char']={value:r,src:'ocr'}; }
+  // Mat. C3474532B  (fallback if barcode missed)
+  if (!found['Mat']){ const r = grab(/Mat\.?\s*([A-Z]?\d{4,}[A-Z]?)/); if (r) found['Mat']={value:r,src:'ocr'}; }
+  // Auftr./Menge  301110 / 4.000 / ST   -> and Einheit
+  const am = joined.match(/Menge:?\s*\n?\s*(\d{3,})\b/);
+  if (am && !found['Auftr']) found['Auftr']={value:am[1],src:'ocr'};
+  const mg = joined.match(/(\d+\.\d{3})\b/); if (mg && !found['Menge']) found['Menge']={value:mg[1],src:'ocr'};
+  const un = joined.match(/\b(ST|PCS|KG|M)\b/); if (un && !found['Einheit']) found['Einheit']={value:un[1],src:'ocr'};
+  // Verfallsdatum: 14.01.2034
+  const vf = grab(/Verfallsdatum:?\s*(\d{2}\.\d{2}\.\d{4})/); if (vf) found['Verfallsdatum']={value:vf,src:'ocr'};
+  // CH-Nr fallback
+  if (!found['CH-Nr']){ const r = grab(/(CH-?\d{5,})/); if (r) found['CH-Nr']={value:r.replace(/^CH-?/,'CH-'),src:'ocr'}; }
+}
+
+// ---- review card -----------------------------------------------------------
+function renderReview(){
+  fieldsEl.innerHTML = '';
+  COLS.forEach(col => {
+    const f = current[col];
+    const cls = f.src==='bc' ? 'src-bc' : (f.src==='ocr' ? 'src-ocr' : '');
+    const row = document.createElement('div');
+    row.className = 'field ' + cls;
+    row.innerHTML = `<label>${col}</label><input data-col="${col}" value="${(f.value||'').replace(/"/g,'&quot;')}" spellcheck="false">`;
+    fieldsEl.appendChild(row);
+  });
+  review.classList.add('show');
+  review.scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+fieldsEl.addEventListener('input', e => {
+  const col = e.target.dataset.col; if (col && current) current[col].value = e.target.value;
+});
+
+// Add row: freeze the reviewed values into `rows`, save, redraw the live table.
+addBtn.addEventListener('click', () => {
+  if (!current) return;
+  const row = {}; COLS.forEach(c => row[c] = current[c].value);
+  rows.push(row); current = null; review.classList.remove('show'); saveRows(); renderTable();
+});
+discardBtn.addEventListener('click', () => { current=null; review.classList.remove('show'); });
+
+// ---- table -----------------------------------------------------------------
+function renderTable(){
+  document.getElementById('cnt').textContent = rows.length;
+  const head = document.getElementById('head');
+  head.innerHTML = '<th></th>' + COLS.map(c=>`<th>${c}</th>`).join('');
+  const body = document.getElementById('body');
+  if (!rows.length){ body.innerHTML = `<tr><td class="empty" colspan="${COLS.length+1}">No rows yet. Scan or upload a label.</td></tr>`; return; }
+  body.innerHTML = rows.map((r,i) =>
+    `<tr><td class="del" data-i="${i}">✕</td>` + COLS.map(c=>`<td>${(r[c]||'').replace(/</g,'&lt;')}</td>`).join('') + '</tr>'
+  ).join('');
+}
+document.getElementById('body').addEventListener('click', e => {
+  const i = e.target.dataset.i; if (i!==undefined){ rows.splice(+i,1); saveRows(); renderTable(); }
+});
+
+// ---- export ----------------------------------------------------------------
+exportBtn.addEventListener('click', () => {
+  if (!rows.length){ setStatus('Nothing to export yet'); return; }
+  const ws = XLSX.utils.json_to_sheet(rows, { header: COLS });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Labels');
+  const d = new Date(); const stamp = d.toISOString().slice(0,10);
+  XLSX.writeFile(wb, `WAE_labels_${stamp}.xlsx`);
+});
+clearBtn.addEventListener('click', () => { if (confirm('Clear all rows?')){ rows.length=0; saveRows(); renderTable(); } });
+
+renderTable();
+</script>
+</body>
+</html>
