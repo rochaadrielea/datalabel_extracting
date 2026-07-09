@@ -82,8 +82,8 @@
   /* results table */
   .tablewrap{margin:8px 0 96px;border:1px solid var(--line);border-radius:12px;overflow:auto;}
   table{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:12px;}
-  th{background:var(--panel-2);color:var(--ink-dim);text-align:left;padding:9px 10px;position:sticky;top:0;white-space:nowrap;}
-  td{padding:9px 10px;border-top:1px solid var(--line);white-space:nowrap;}
+  th{background:var(--panel-2);color:var(--ink-dim);text-align:left;padding:6px 8px;position:sticky;top:0;white-space:nowrap;font-size:11px;}
+  td{padding:6px 8px;border-top:1px solid var(--line);white-space:nowrap;font-size:11px;}
   tr:nth-child(even) td{background:rgba(255,255,255,.015);}
   td.del{color:var(--bad);cursor:pointer;text-align:center;width:34px;}
   .empty{color:var(--ink-dim);font-family:var(--mono);font-size:12px;text-align:center;padding:22px;}
@@ -167,7 +167,7 @@
 // Bump VERSION every time you change this file. It shows in the header, so on
 // the phone you can instantly see whether you're running the new build or a
 // stale cached one.
-const VERSION='v4.0';
+const VERSION='v4.1';
 document.getElementById('ver').textContent=VERSION;
 
 // "Get latest version": wipes cached copies of the app and reloads with a
@@ -387,7 +387,12 @@ function checkMandatory(){
     reticle.classList.remove('partial');
     if(autoMode){
       const key=found['Mat'].value+'|'+found['Char'].value;
-      if(key!==lastAdded){ lastAdded=key; autoAdd(); }
+      if(key!==lastAdded){ lastAdded=key;
+        // grace window: keep reading ~1.2s so Definition / SerNr / L-Char /
+        // Auftr / Menge from the same label land in this row too, then add.
+        setStatus('Mat+Char caught — grabbing details…','busy');
+        setTimeout(autoAdd,1200);
+      }
     }
     return;
   }
@@ -510,6 +515,8 @@ function applyBarcodes(codes,found){
   }
 }
 // OCR rules (amber dot). THIS is what you tune per label variant.
+// repair classic OCR digit confusions in numeric fields
+function digitFix(v){return v.replace(/O/g,'0').replace(/B/g,'8').replace(/S/g,'5').replace(/[Il]/g,'1');}
 function parseOcr(text){
   const j=text.split(/\n/).map(l=>l.trim()).filter(Boolean).join('\n'); const out={};
   const g=re=>{const m=j.match(re);return m?m[1].trim():'';};
@@ -519,9 +526,10 @@ function parseOcr(text){
   let r;
   if(r=g(/Rev\.?\s*([A-Z])\b/))out.Rev=r;
   if(r=g(/SerNr\.?\s*(\d{2,})/))out.SerNr=r;
-  // Char.: 5-7 digit batch on its own line; [CG] tolerates OCR reading C as G
-  if(r=g(/(?:^|\n)\s*[CG]har\.?\s*[:.]?\s*(\d{5,7})\b/))out.Char=r;
-  if(r=g(/L-?[CG]har\.?\s*[:.]?\s*(\d{4,})/))out['L-Char']=r;
+  // Char.: tolerate broken print — "Char." may read as "har.", "Chal", "Ghar";
+  // digits may read as letters (O/B/S/I). digitFix repairs them.
+  if(r=g(/(?:^|\n)\s*[CG]?ha[rl]?\.?\s*[:.]?\s*([0-9OBSIl]{5,7})\b/))out.Char=digitFix(r);
+  if(r=g(/L-?[CG]?ha[rl]?\.?\s*[:.]?\s*([0-9OBSIl]{4,})/))out['L-Char']=digitFix(r);
   // Mat.: letters+digits code straight after the word Mat (N3508108X, CN400190-R, 3007458)
   if(r=g(/Mat\.?\s*[:.]?\s*([A-Z]{0,2}\d{4,}[A-Z0-9-]{0,6})/i))out.Mat=out.Mat||r.toUpperCase();
   if(r=g(/Menge:?\s*\n?\s*(\d{3,})/))out.Auftr=r;
