@@ -33,6 +33,11 @@
   video{width:100%;height:100%;object-fit:cover;display:block;}
   .reticle{position:absolute;inset:14% 8%;border:2px solid var(--signal);border-radius:10px;box-shadow:0 0 0 100vmax rgba(0,0,0,.32);pointer-events:none;opacity:.9;transition:border-color .2s;}
   .reticle.hit{border-color:#fff;}
+  .reticle.partial{border-color:var(--warn);}
+  .donesplash{position:absolute;inset:0;background:rgba(53,224,161,.88);display:none;align-items:center;justify-content:center;flex-direction:column;gap:6px;z-index:5;}
+  .donesplash.show{display:flex;}
+  .donesplash .check{font-size:72px;line-height:1;color:#08130E;font-weight:700;}
+  .donesplash .what{font-family:var(--mono);color:#08130E;font-weight:700;font-size:14px;text-align:center;padding:0 14px;}
   .reticle::before{content:"";position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--signal),transparent);animation:sweep 2.2s ease-in-out infinite;}
   @keyframes sweep{0%,100%{top:3%}50%{top:95%}}
   @media (prefers-reduced-motion:reduce){.reticle::before{animation:none;top:50%}}
@@ -98,7 +103,9 @@
   <div class="stage">
     <video id="vid" playsinline muted autoplay></video>
     <div class="reticle" id="reticle"></div>
+    <div class="donesplash" id="doneSplash"><div class="check">&#10003;</div><div class="what" id="doneTxt"></div></div>
     <div class="camtools">
+      <div class="chip on" id="autoChip">Auto-add</div>
       <div class="chip" id="torchChip" style="display:none;">Light</div>
       <div class="chip" id="ocrChip">Read text now</div>
       <div class="zoomwrap" id="zoomWrap" style="display:none;">
@@ -160,7 +167,7 @@
 // Bump VERSION every time you change this file. It shows in the header, so on
 // the phone you can instantly see whether you're running the new build or a
 // stale cached one.
-const VERSION='v2.1';
+const VERSION='v3.0';
 document.getElementById('ver').textContent=VERSION;
 
 // "Get latest version": wipes cached copies of the app and reloads with a
@@ -264,17 +271,72 @@ function beginScanLoop(){
   requestAnimationFrame(tick);
 }
 
-let lastBeep=0;
+let lastBeep=0, lastAdded='', autoMode=true, ocrBusy=false;
+const autoChip=document.getElementById('autoChip');
+autoChip.addEventListener('click',()=>{autoMode=!autoMode;autoChip.classList.toggle('on',autoMode);
+  setStatus(autoMode?'Auto-add ON — Mat+Char adds the row':'Manual mode — review each label','live');});
+
 function onBarcode(text){
   const before=JSON.stringify(found);
   applyBarcodes([text],found);
-  if(JSON.stringify(found)===before) return;   // nothing new, stay quiet
-  reticle.classList.add('hit'); statusEl.className='status hit';
-  const got=COLS.filter(k=>found[k]&&found[k].src==='bc');
-  statusTxt.textContent='Caught: '+got.join(', ');
+  if(JSON.stringify(found)===before) return;   // nothing new
+  reticle.classList.add('hit');
   const now=Date.now(); if(now-lastBeep>400){beep();lastBeep=now;}
-  setTimeout(()=>{reticle.classList.remove('hit'); if(scanning)statusEl.className='status live';},500);
-  showReviewFromFound();   // review card updates live as codes are caught
+  setTimeout(()=>reticle.classList.remove('hit'),300);
+  checkMandatory();
+  if(!autoMode) showReviewFromFound();
+}
+
+// mandatory = Mat + Char. Both caught -> green splash + auto-add. Only one ->
+// amber border; if Mat is there but Char isn't (EQ-label), auto-run OCR to
+// try to read the printed Char line.
+function checkMandatory(){
+  const hasMat=!!found['Mat'], hasChar=!!found['Char'];
+  if(hasMat&&hasChar){
+    reticle.classList.remove('partial');
+    if(autoMode){
+      const key=found['Mat'].value+'|'+found['Char'].value;
+      if(key!==lastAdded){ lastAdded=key; autoAdd(); }
+    }
+    return;
+  }
+  if(hasMat||hasChar){
+    reticle.classList.add('partial');
+    statusEl.className='status busy';
+    statusTxt.textContent=hasMat?('Mat '+found['Mat'].value+' — need Char'):('Char '+found['Char'].value+' — need Mat');
+    // EQ-label case: Mat caught by barcode but Char is printed text only
+    if(hasMat&&!hasChar&&autoMode&&!ocrBusy) autoOcrForChar();
+  }
+}
+
+async function autoOcrForChar(){
+  ocrBusy=true;
+  try{
+    if(!worker) worker=await Tesseract.createWorker('eng');
+    for(let i=0;i<3&&!found['Char'];i++){
+      const {data}=await worker.recognize(grabUpscaled(vid));
+      const p=parseOcr(data.text||'');
+      if(p.Char){ found['Char']={value:p.Char,src:'ocr'}; }
+      // opportunistic: keep other OCR fields too
+      for(const k in p){ if(!found[k]) found[k]={value:p[k],src:'ocr'}; }
+      await new Promise(r=>setTimeout(r,200));
+    }
+  }catch(_){}
+  ocrBusy=false;
+  checkMandatory();
+}
+
+function autoAdd(){
+  const row={}; COLS.forEach(c=>row[c]=found[c]?found[c].value:'');
+  rows.push(row); saveRows(); renderTable();
+  // green full-screen splash so you can see it from arm's length
+  const splash=document.getElementById('doneSplash');
+  document.getElementById('doneTxt').textContent=row['Mat']+'  /  Char '+row['Char'];
+  splash.classList.add('show');
+  beep(); setTimeout(beep,140);
+  setTimeout(()=>{ splash.classList.remove('show');
+    found={}; current=null; review.classList.remove('show');
+    setStatus('Row added — next tag','live'); },900);
 }
 function beep(){try{const a=new (window.AudioContext||window.webkitAudioContext)();
   const o=a.createOscillator();const g=a.createGain();o.connect(g);g.connect(a.destination);
@@ -346,10 +408,12 @@ function rotateCanvas(src,deg){
 // Barcode rules (reliable, green dot). Add rules here for new code shapes.
 function applyBarcodes(codes,found){
   for(const raw of codes){ const s=raw.trim();
+    // CH-884843 barcode == Char. 884843 on the label (verified on screw label)
     if(/^CH-?\d+/i.test(s)){ found['CH-Nr']={value:s.replace(/^CH-?/i,'CH-'),src:'bc'};
-      const n=s.replace(/^CH-?/i,''); if(/^\d+$/.test(n)&&!found['SerNr'])found['SerNr']={value:n,src:'bc'}; continue; }
+      const n=s.replace(/^CH-?/i,''); if(/^\d+$/.test(n))found['Char']={value:n,src:'bc'}; continue; }
+    // EQ-labels (serialized parts): EQ number is NOT the Char — Char must come from OCR
     if(/^EQ-?\d+/i.test(s)){ found['CH-Nr']={value:s,src:'bc'}; continue; }
-    if(/^[A-Z]?\d{4,}[A-Z]?$/.test(s)&&!found['Mat']){ found['Mat']={value:s,src:'bc'}; continue; }
+    if(/^[A-Z]{0,2}\d{4,}[A-Z0-9-]*$/i.test(s)&&!found['Mat']){ found['Mat']={value:s,src:'bc'}; continue; }
     if(/^\d{10}$/.test(s)&&!found['L-Char']){ found['L-Char']={value:s,src:'bc'}; continue; }
   }
 }
