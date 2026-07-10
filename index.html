@@ -167,7 +167,7 @@
 // Bump VERSION every time you change this file. It shows in the header, so on
 // the phone you can instantly see whether you're running the new build or a
 // stale cached one.
-const VERSION='v4.1';
+const VERSION='v4.2';
 document.getElementById('ver').textContent=VERSION;
 
 // "Get latest version": wipes cached copies of the app and reloads with a
@@ -260,7 +260,7 @@ async function nativeLoop(){
         if(codes&&codes.length){ for(const c of codes){ if(c.rawValue) onBarcode(c.rawValue.trim()); } }
       }
     }catch(_){}
-    await new Promise(r=>setTimeout(r,140));
+    await new Promise(r=>setTimeout(r,80));
   }
 }
 function stopCamera(){ scanning=false; stopOcrLoop();
@@ -319,7 +319,7 @@ async function startOcrLoop(){
         for(const k in p) castVote(k,p[k]);
       }
     }catch(_){}
-    await new Promise(r=>setTimeout(r,350));
+    await new Promise(r=>setTimeout(r,120));
   }
   ocrLoopOn=false;
 }
@@ -331,7 +331,8 @@ function centerCrop(src){
   const mx=Math.round(w*0.06), my=Math.round(h*0.10);
   const cw=w-2*mx, ch=h-2*my;
   const c=document.createElement('canvas');
-  const sc=Math.min(2.2, 1900/Math.max(cw,ch)+0.001);
+  // cap ~1300px on the long side: much faster per pass, still sharp enough
+  const sc=Math.min(1.6, 1300/Math.max(cw,ch));
   c.width=Math.round(cw*sc); c.height=Math.round(ch*sc);
   const ctx=c.getContext('2d');
   ctx.filter='grayscale(1) contrast(1.25)';
@@ -391,7 +392,7 @@ function checkMandatory(){
         // grace window: keep reading ~1.2s so Definition / SerNr / L-Char /
         // Auftr / Menge from the same label land in this row too, then add.
         setStatus('Mat+Char caught — grabbing details…','busy');
-        setTimeout(autoAdd,1200);
+        setTimeout(autoAdd,800);
       }
     }
     return;
